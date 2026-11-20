@@ -18,7 +18,8 @@
 import nodeFs from 'node:fs';
 import path from 'node:path';
 import { spawn as nodeSpawn } from 'node:child_process';
-import { isPidAlive as nodeIsPidAlive, slotFromEnv } from '../process-probe.mjs';
+// a run is running only while its pid is alive and still PixInsight (a reused pid is another program)
+import { isPixInsightPid as nodeIsPidAlive, slotFromEnv } from '../process-probe.mjs';
 import { machineId } from '../machine-id.mjs';
 import { toPixPath } from '../platform.mjs';
 import { resolveExportPath } from './images.mjs';

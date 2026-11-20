@@ -17,7 +17,8 @@
 // `exec(cmd, args)` (argv array, no shell), never a `cmd1 | cmd2` string.
 // ============================================================================
 
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import fs from 'node:fs/promises';
 
 // ---------------------------------------------------------------------------
@@ -299,6 +300,34 @@ export function isPidAlive(pid, kill = process.kill.bind(process)) {
     if (e?.code === 'EPERM') return true;
     return null;
   }
+}
+
+// The image name of process `pid` from the OS, synchronously: 'pixinsight.exe' on Windows (tasklist),
+// 'PixInsight' elsewhere (/proc/<pid>/comm, ps). null when there is no such process or the OS can't say.
+function defaultProcessName(pid, platform) {
+  try {
+    if (platform === 'win32') {
+      const out = execFileSync('tasklist', ['/FI', `PID eq ${pid}`, '/NH', '/FO', 'CSV'], { timeout: 15000, windowsHide: true, encoding: 'utf8' });
+      const fields = parseCsvLine(out);
+      return fields && fields[1] === String(pid) ? fields[0] : null;
+    }
+    if (platform === 'linux') return readFileSync(`/proc/${pid}/comm`, 'utf8').trim() || null;
+    return execFileSync('ps', ['-o', 'comm=', '-p', String(pid)], { timeout: 15000, encoding: 'utf8' }).trim().split('/').pop() || null;
+  } catch {
+    return null;
+  }
+}
+
+// Whether process `pid` is alive AND is PixInsight. A run's pid outlives its process: Windows hands the
+// number to another program (a svchost, say), and a bare isPidAlive() would then call the run running for
+// as long as that program lives. false when the pid is gone or belongs to another program; null when the
+// OS can't say. `kill` and `processName` are injectable for tests.
+export function isPixInsightPid(pid, { platform = process.platform, kill, processName = defaultProcessName } = {}) {
+  const alive = isPidAlive(pid, kill);
+  if (alive !== true) return alive;
+  const name = processName(pid, platform);
+  if (name == null) return null;
+  return /^pixinsight(\.exe)?$/i.test(String(name).trim());
 }
 
 /**
