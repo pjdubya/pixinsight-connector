@@ -29,7 +29,7 @@ import * as fsp from 'node:fs/promises';
 import os from 'node:os';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createBridge as realCreateBridge, BridgeAbortError, BridgeCrashError } from './bridge.mjs';
-import { createProcessProbe } from './process-probe.mjs';
+import { createProcessProbe, slotFromEnv } from './process-probe.mjs';
 import { resolvePlatform, PlatformError } from './platform.mjs';
 import { createWorkspace, workspacePaths, isInside, WorkspaceError, WORKSPACE_FIX } from './workspace.mjs';
 import { machineId as realMachineId } from './machine-id.mjs';
@@ -756,7 +756,8 @@ export async function serve() {
 
   const { platform, platformError } = resolveServePlatform({ env: process.env, platform: process.platform, existsSync, homeDir: os.homedir() });
   if (platformError) log(`${platformError.message} Starting anyway; tools that need PixInsight will report this.`);
-  const probe = createProcessProbe();
+  // PIXINSIGHT_CONNECTOR_SLOT: this connector's PixInsight is the instance in that slot (bridge.mjs)
+  const probe = createProcessProbe({ slot: slotFromEnv(process.env.PIXINSIGHT_CONNECTOR_SLOT) });
   const workspace = createWorkspace({ cwd: process.cwd(), env: process.env, homeDir: os.homedir(), platform: process.platform, log });
   const initial = workspace.snapshot();
   if (!initial.usable) log(`No usable workspace: "${initial.dir}" ${initial.reason}. Starting anyway; tools that need it will say so.`);

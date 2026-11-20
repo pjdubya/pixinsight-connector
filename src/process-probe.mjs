@@ -167,26 +167,88 @@ function parseCsvLine(line) {
   return matches ? matches.map((s) => s.slice(1, -1)) : null;
 }
 
-async function winFindProcess({ exec }) {
-  const out = await exec('tasklist', ['/FI', 'IMAGENAME eq PixInsight.exe', '/NH', '/FO', 'CSV']);
-  const fields = parseCsvLine(out);
-  if (!fields || !fields[0] || fields[0].toLowerCase() !== 'pixinsight.exe') return null;
-  return { pid: fields[1] };
+// The PixInsight slot a main window's title shows: "PixInsight" is slot 1, "PixInsight (2)" slot 2.
+// null when the title is not PixInsight's main window (tasklist's "N/A", or a dialog such as the
+// "Fatal Error" a `-x=N:` handoff shows when slot N has no instance).
+export function slotOfTitle(title) {
+  const t = String(title ?? '').trim();
+  if (!/^PixInsight\b/.test(t)) return null;
+  const m = t.match(/\((\d+)\)\s*$/);
+  return m ? Number(m[1]) : 1;
 }
+
+// The slot a PixInsight process was started in, from its command line: `-n=N` is slot N. 'handoff' for a
+// `-x=` launch, which is not an instance but hands a script to one; null when the command line does not
+// say (PixInsight started by hand, without -n: its window title says).
+export function slotOfCommandLine(cmd) {
+  const c = String(cmd ?? '');
+  if (/(^|\s)"?-x=/.test(c)) return 'handoff';
+  const m = c.match(/(^|\s)"?-n=(\d+)/);
+  return m ? Number(m[2]) : null;
+}
+
+// Every PixInsight process with its command line: "pid|command line" per line, from PowerShell's CIM
+// (Win32_Process), with no double quotes in the command so it passes through execFile as one argument.
+const WIN_COMMAND_LINES =
+  "Get-CimInstance Win32_Process | Where-Object Name -eq 'PixInsight.exe' | ForEach-Object { '{0}|{1}' -f $_.ProcessId, $_.CommandLine }";
+
+// A PixInsight slot from the environment (PIXINSIGHT_CONNECTOR_SLOT, PIXINSIGHT_CONNECTOR_WBPP_SLOT), or
+// null when unset or outside PixInsight's [1,256] range.
+export function slotFromEnv(value) {
+  const n = Number(value);
+  return value != null && value !== '' && Number.isInteger(n) && n >= 1 && n <= 256 ? n : null;
+}
+
+// The PixInsight process: any one, or with `slot` (PIXINSIGHT_CONNECTOR_SLOT) the one running in that
+// slot, so another instance -- a run_wbpp run in its own slot -- is never taken for this connector's.
+async function winFindProcess({ exec, slot }) {
+  if (!slot) {
+    const out = await exec('tasklist', ['/FI', 'IMAGENAME eq PixInsight.exe', '/NH', '/FO', 'CSV']);
+    const fields = parseCsvLine(out);
+    if (!fields || !fields[0] || fields[0].toLowerCase() !== 'pixinsight.exe') return null;
+    return { pid: fields[1] };
+  }
+  // the slot from each process's command line (-n=N), which the connector and run_wbpp always pass; a
+  // window title can mislead (a starting instance, a dialog), so it only decides for an instance started
+  // without -n
+  const bySlot = new Map();
+  try {
+    for (const line of (await exec('powershell', [...WIN_PS_COMMON_ARGS, WIN_COMMAND_LINES])).split('\n')) {
+      const at = line.indexOf('|');
+      if (at > 0) bySlot.set(line.slice(0, at).trim(), slotOfCommandLine(line.slice(at + 1)));
+    }
+  } catch {
+    // no PowerShell answer: titles only
+  }
+  const out = await exec('tasklist', ['/V', '/FI', 'IMAGENAME eq PixInsight.exe', '/NH', '/FO', 'CSV']);
+  for (const line of out.split('\n')) {
+    const fields = parseCsvLine(line);
+    if (!fields || !fields[0] || fields[0].toLowerCase() !== 'pixinsight.exe') continue;
+    const fromCommand = bySlot.get(fields[1]);
+    if (fromCommand === 'handoff') continue;
+    const s = typeof fromCommand === 'number' ? fromCommand : slotOfTitle(fields[fields.length - 1]);
+    if (s === slot) return { pid: fields[1] };
+  }
+  return null;
+}
+
+// Get-Process for the found instance (with a slot) or the first PixInsight.
+const winGetProcess = (io, proc) => (io.slot ? `Get-Process -Id ${Number(proc.pid)}` : 'Get-Process -Name PixInsight');
 
 const WIN_PS_COMMON_ARGS = ['-NoProfile', '-NonInteractive', '-Command'];
 
 const winStrategy = {
-  async isRunning({ exec }) {
-    return (await winFindProcess({ exec })) !== null;
+  async isRunning(io) {
+    return (await winFindProcess(io)) !== null;
   },
 
-  async startedAt({ exec }) {
-    const proc = await winFindProcess({ exec });
+  async startedAt(io) {
+    const { exec } = io;
+    const proc = await winFindProcess(io);
     if (!proc) return null;
     const out = await exec('powershell', [
       ...WIN_PS_COMMON_ARGS,
-      "Get-Process -Name PixInsight -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty StartTime | ForEach-Object { $_.ToString('o') }",
+      `${winGetProcess(io, proc)} -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty StartTime | ForEach-Object { $_.ToString('o') }`,
     ]);
     const line = out.trim();
     if (!line) return null;
@@ -194,12 +256,13 @@ const winStrategy = {
     return Number.isNaN(t) ? null : t;
   },
 
-  async memoryMB({ exec }) {
-    const proc = await winFindProcess({ exec });
+  async memoryMB(io) {
+    const { exec } = io;
+    const proc = await winFindProcess(io);
     if (!proc) return null;
     const out = await exec('powershell', [
       ...WIN_PS_COMMON_ARGS,
-      'Get-Process -Name PixInsight -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty WorkingSet64',
+      `${winGetProcess(io, proc)} -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty WorkingSet64`,
     ]);
     const bytes = Number(out.trim());
     if (!Number.isFinite(bytes) || bytes <= 0) return null;
@@ -244,6 +307,7 @@ export function isPidAlive(pid, kill = process.kill.bind(process)) {
  * @param {(cmd: string, args: string[]) => Promise<string>} [opts.exec] - runs a program with no shell.
  * @param {(path: string) => Promise<string|null>} [opts.readFile] - null instead of throwing on a missing file.
  * @param {() => Promise<string[]>} [opts.listProc] - numeric /proc entries (Linux only; unused elsewhere).
+ * @param {number|null} [opts.slot] - only the instance in this PixInsight slot counts (Windows; slotFromEnv).
  * @returns {{ isRunning: () => Promise<boolean|null>, startedAt: () => Promise<number|null>, memoryMB: () => Promise<number|null> }}
  */
 export function createProcessProbe(opts = {}) {
@@ -252,6 +316,7 @@ export function createProcessProbe(opts = {}) {
     exec: opts.exec ?? defaultExec,
     readFile: opts.readFile ?? defaultReadFile,
     listProc: opts.listProc ?? defaultListProc,
+    slot: opts.slot ?? null,
   };
 
   const strategy = STRATEGIES[platform];
