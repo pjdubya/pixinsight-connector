@@ -14,6 +14,7 @@ import path from 'node:path';
 import nodeNet from 'node:net';
 import { spawn as nodeSpawn } from 'node:child_process';
 import { toPixPath } from './platform.mjs';
+import { slotFromEnv } from './process-probe.mjs';
 
 const TEMPLATE_URL = new URL('../pjsr/watcher.template.js', import.meta.url);
 
@@ -319,7 +320,9 @@ export async function ensurePixInsight({ platform, probe, spawn, log, env, timeo
         return { started: false, skipped: 'could not determine whether PixInsight is already running; not starting a second instance' };
       }
     }
-    return await spawnAndWait({ platform, probe, doSpawn, logFn, timeoutMs });
+    // PIXINSIGHT_CONNECTOR_SLOT: start it in that slot, so it is this connector's and no other instance's
+    const slot = slotFromEnv(environment.PIXINSIGHT_CONNECTOR_SLOT);
+    return await spawnAndWait({ platform, probe, doSpawn, logFn, timeoutMs, args: slot ? [`-n=${slot}`] : [] });
   } finally {
     await lock?.release();
   }
@@ -328,13 +331,13 @@ export async function ensurePixInsight({ platform, probe, spawn, log, env, timeo
 // How much longer than one launch's own wait a connector waits for another's launch to finish.
 const MUTEX_WAIT_MARGIN_MS = 30_000;
 
-async function spawnAndWait({ platform, probe, doSpawn, logFn, timeoutMs }) {
+async function spawnAndWait({ platform, probe, doSpawn, logFn, timeoutMs, args = [] }) {
   logFn('PixInsight is not running; starting it (set PIXINSIGHT_CONNECTOR_AUTOSTART=0 to disable)');
   // An executable that cannot be run (a missing PIXINSIGHT_BIN, no execute permission) makes spawn
   // emit 'error' after it returns. Unhandled, that event would kill the whole server; handled, it
   // ends the wait below at once with the path and the fix.
   let spawnError = null;
-  const child = doSpawn(platform.piBin, [], { detached: true, stdio: 'ignore', windowsHide: true });
+  const child = doSpawn(platform.piBin, args, { detached: true, stdio: 'ignore', windowsHide: true });
   child?.on?.('error', (e) => { spawnError ??= e; });
   child?.unref?.();
 
