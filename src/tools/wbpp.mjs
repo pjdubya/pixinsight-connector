@@ -7,7 +7,8 @@
 // instance and returns a run id; wbpp_status reports it. Run records live in
 // <workspace>/agentic/scratch/wbpp/<run id>/ (run.json, exit.json, the instance's console output,
 // and the pipeline-builder script when one is generated). WBPP writes only into output_dir, which is
-// held to <workspace>/output or the state folder.
+// held to <workspace>/output, the state folder, or a folder named WBPP in an existing target folder
+// (<target>\WBPP), so WBPP can reuse the calibration files of earlier runs kept there.
 //
 // run_wbpp refuses while this workspace's watcher reports "busy" (a command running in the GUI
 // instance) and while an earlier run_wbpp instance of this workspace is still running.
@@ -17,7 +18,8 @@
 import nodeFs from 'node:fs';
 import path from 'node:path';
 import { spawn as nodeSpawn } from 'node:child_process';
-import { isPidAlive as nodeIsPidAlive } from '../process-probe.mjs';
+// a run is running only while its pid is alive and still PixInsight (a reused pid is another program)
+import { isPixInsightPid as nodeIsPidAlive, slotFromEnv } from '../process-probe.mjs';
 import { machineId } from '../machine-id.mjs';
 import { toPixPath } from '../platform.mjs';
 import { resolveExportPath } from './images.mjs';
@@ -29,6 +31,22 @@ const REFERENCE = ['auto', 'auto_by_keyword'];
 const FS_METRICS = ['FWHM', 'eccentricity', 'SNR', 'PSFSignalWeight', 'median', 'numberOfStars'];
 const LIGHT = 4; // WBPP image type index for rejection_N / combination_N: 1 Bias, 2 Dark, 3 Flat, 4 Light
 const PARAM_NAME_RE = /^[A-Za-z][A-Za-z0-9_.]*$/;
+
+// output_dir: an absolute folder named WBPP whose parent (the target folder) exists, else a folder
+// inside <workspace>/output or the state folder (resolveExportPath).
+export function resolveWbppOutputDir(outputDir, { workspaceOutputDir, stateDir }, { fs = nodeFs, platform = process.platform } = {}) {
+  const p = platform === 'win32' ? path.win32 : path.posix;
+  if (p.isAbsolute(outputDir)) {
+    const target = p.resolve(outputDir);
+    if (p.basename(target).toUpperCase() === 'WBPP') {
+      const parent = p.dirname(target);
+      if (parent !== target && fs.existsSync(parent) && fs.statSync(parent).isDirectory()) return { path: target };
+      return { error: `output_dir: the target folder ${parent} of ${target} does not exist.` };
+    }
+  }
+  const r = resolveExportPath(outputDir, { outputDir: workspaceOutputDir, stateDir }, platform);
+  return r.error ? { error: `${r.error.replace('file_path', 'output_dir')} A folder named WBPP in an existing target folder is also allowed.` } : r;
+}
 
 // A WBPP -r value is split on commas by PixInsight, so no value may contain one.
 function noComma(v, label) {
@@ -183,7 +201,8 @@ export function makeWbppTools({ spawn = nodeSpawn, fs = nodeFs, isPidAlive = nod
     description:
       'Start WeightedBatchPreprocessing (WBPP) headless in a separate PixInsight instance (PixInsight -n --automation-mode ' +
       '--force-exit) over input_dirs, writing into output_dir, and return a run id at once; wbpp_status reports the run. ' +
-      'output_dir must lie inside <workspace>/output (a relative path is resolved there) or the state folder. Only the WBPP ' +
+      'output_dir must lie inside <workspace>/output (a relative path is resolved there) or the state folder, or be an absolute ' +
+      'folder named WBPP in an existing target folder (<target>\\WBPP, created if missing; WBPP reuses earlier files there). Only the WBPP ' +
       'parameters given are passed; WBPP\'s own settings apply to the rest. Interactive local normalization and frame selection are ' +
       'turned off so nothing waits for a click. optimize_darks and drizzle_scale are applied to every light group by a generated ' +
       'pipeline-builder script. extra_params passes further WBPP automation parameters by name (BPP-Automation.js lists them). ' +
@@ -193,7 +212,7 @@ export function makeWbppTools({ spawn = nodeSpawn, fs = nodeFs, isPidAlive = nod
       type: 'object',
       properties: {
         input_dirs: { type: 'array', items: { type: 'string' }, description: 'Folders WBPP scans recursively for lights, darks, flats and bias (WBPP dir=)' },
-        output_dir: { type: 'string', description: 'WBPP output folder: relative to <workspace>/output, or absolute inside <workspace>/output or the state folder' },
+        output_dir: { type: 'string', description: 'WBPP output folder: relative to <workspace>/output, absolute inside <workspace>/output or the state folder, or an absolute <target>\\WBPP folder whose target folder exists' },
         keywords: {
           type: 'array', description: 'Grouping keywords [{name, mode}], mode pre (calibration groups), post (integration groups) or prepost',
           items: { type: 'object', properties: { name: { type: 'string' }, mode: { type: 'string', enum: KEYWORD_MODES } } },
@@ -227,8 +246,8 @@ export function makeWbppTools({ spawn = nodeSpawn, fs = nodeFs, isPidAlive = nod
       for (const d of input.input_dirs ?? []) {
         if (!path.isAbsolute(String(d)) || !fs.existsSync(String(d))) return { isError: true, text: `input_dirs: folder not found: ${d}` };
       }
-      const resolved = resolveExportPath(String(input.output_dir), { outputDir: api.workspace.outputDir, stateDir: path.dirname(api.workspace.scratchDir) });
-      if (resolved.error) return { isError: true, text: resolved.error.replace('file_path', 'output_dir') };
+      const resolved = resolveWbppOutputDir(String(input.output_dir), { workspaceOutputDir: api.workspace.outputDir, stateDir: path.dirname(api.workspace.scratchDir) }, { fs });
+      if (resolved.error) return { isError: true, text: resolved.error };
       if (input.reference_image !== undefined && !fs.existsSync(String(input.reference_image))) return { isError: true, text: `reference_image not found: ${input.reference_image}` };
       if (input.drizzle_scale !== undefined && !(typeof input.drizzle_scale === 'number' && input.drizzle_scale > 0)) throw new Error('drizzle_scale: a number > 0');
 
@@ -254,7 +273,10 @@ export function makeWbppTools({ spawn = nodeSpawn, fs = nodeFs, isPidAlive = nod
       const rArg = wbppArgs(input, { scriptPath, outputDir: resolved.path, builderPath });
       const logPath = path.join(dir, 'pixinsight.log');
       const fd = fs.openSync(logPath, 'a');
-      const argv = ['-n', '--automation-mode', `-r=${rArg}`, '--force-exit'];
+      // PIXINSIGHT_CONNECTOR_WBPP_SLOT: the run's own slot, apart from the connectors' PixInsight
+      // (PIXINSIGHT_CONNECTOR_SLOT), so no watcher is ever sent to it
+      const wbppSlot = slotFromEnv(process.env.PIXINSIGHT_CONNECTOR_WBPP_SLOT);
+      const argv = [wbppSlot ? `-n=${wbppSlot}` : '-n', '--automation-mode', `-r=${rArg}`, '--force-exit'];
       let child;
       try {
         child = spawn(api.platform.piBin, argv, { detached: true, stdio: ['ignore', fd, fd], windowsHide: true });

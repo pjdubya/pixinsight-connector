@@ -17,7 +17,7 @@ import { tools as reprojectTools, reprojectPjsr } from '../src/tools/reproject.m
 import { tools as astrometryTools } from '../src/tools/astrometry.mjs';
 import { tools as catalogTools, catalogStarsPjsr } from '../src/tools/catalog.mjs';
 import { tools as alignTools, alignBatchPjsr } from '../src/tools/align.mjs';
-import { makeWbppTools, wbppArgs, wbppScriptPath, pipelineBuilderScript } from '../src/tools/wbpp.mjs';
+import { makeWbppTools, wbppArgs, wbppScriptPath, pipelineBuilderScript, resolveWbppOutputDir } from '../src/tools/wbpp.mjs';
 
 const tool = (list, name) => list.find((t) => t.name === name);
 
@@ -444,6 +444,31 @@ test('run_wbpp refuses paths outside the workspace, commas, and a missing WBPP.j
   assert.equal(r.isError, true);
   assert.match(r.text, /WBPP\.js not found/);
   assert.equal(wbppScriptPath({ imageSolverPath: 'C:\\PI\\src\\scripts\\ImageSolver\\ImageSolver.js' }), 'C:\\PI\\src\\scripts\\BatchPreprocessing\\WBPP.js');
+});
+
+test('run_wbpp writes into <target>/WBPP outside the workspace when the target folder exists', async (t) => {
+  const f = wbppFixture(t);
+  const target = fs.mkdtempSync(path.join(os.tmpdir(), 'wbpp-target-'));
+  t.after(() => fs.rmSync(target, { recursive: true, force: true }));
+  const wbppDir = path.join(target, 'WBPP');
+  const out = await f.runWbpp.handler(f.api, { input_dirs: [f.input], output_dir: wbppDir });
+  assert.ok(!out.isError, out.text);
+  assert.ok(fs.existsSync(wbppDir));
+  assert.ok(f.spawned[0].argv[2].includes(`outputDirectory=${wbppDir.replaceAll('\\', '/')}`));
+
+  const missingTarget = await f.runWbpp.handler(f.api, { input_dirs: [f.input], output_dir: path.join(target, 'nope', 'WBPP') });
+  assert.equal(missingTarget.isError, true);
+  assert.match(missingTarget.text, /does not exist/);
+  const notWbpp = await f.runWbpp.handler(f.api, { input_dirs: [f.input], output_dir: path.join(target, 'Processing') });
+  assert.equal(notWbpp.isError, true);
+  assert.match(notWbpp.text, /output_dir must be inside/);
+  assert.equal(f.spawned.length, 1);
+
+  const fakeFs = { existsSync: (x) => x === 'D:\\Pictures\\NINA\\M27', statSync: () => ({ isDirectory: () => true }) };
+  const ctx = { workspaceOutputDir: 'D:\\WS\\output', stateDir: 'D:\\WS\\agentic' };
+  assert.deepEqual(resolveWbppOutputDir('D:\\Pictures\\NINA\\M27\\wbpp', ctx, { fs: fakeFs, platform: 'win32' }), { path: 'D:\\Pictures\\NINA\\M27\\wbpp' });
+  assert.ok(resolveWbppOutputDir('D:\\Pictures\\NINA\\M27\\WBPP\\..\\..\\WBPP', ctx, { fs: fakeFs, platform: 'win32' }).error);
+  assert.ok(resolveWbppOutputDir('WBPP', ctx, { fs: fakeFs, platform: 'win32' }).path.startsWith('D:\\WS\\output'));
 });
 
 test('wbpp_status reports running, then finished with masters, per-group counts and the console tail', async (t) => {

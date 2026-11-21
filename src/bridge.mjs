@@ -14,7 +14,7 @@ import { spawn } from 'child_process';
 import { ensurePixInsight, spawnFailureMessage, createLaunchMutex } from './runtime.mjs';
 import { toPixPath } from './platform.mjs';
 import { scriptPathProblem } from './workspace.mjs';
-import { isPidAlive as defaultIsPidAlive, onProcessExit } from './process-probe.mjs';
+import { isPidAlive as defaultIsPidAlive, onProcessExit, slotFromEnv } from './process-probe.mjs';
 
 const DEFAULT_LINGER_MS = 8000;
 const DEFAULT_POLL_INTERVAL_MS = 500;
@@ -262,6 +262,9 @@ export function createBridge(opts = {}) {
   }
   const autoLaunch = opts.autoLaunch ?? (env.PIXINSIGHT_CONNECTOR_AUTOLAUNCH !== '0');
   const lingerMs = opts.lingerMs ?? (Number(env.PIXINSIGHT_CONNECTOR_LINGER_MS) || DEFAULT_LINGER_MS);
+  // PIXINSIGHT_CONNECTOR_SLOT: the watcher goes to the PixInsight instance in that slot (-x=<slot>:), never
+  // to whichever instance runs first -- which may be a run_wbpp run (PIXINSIGHT_CONNECTOR_WBPP_SLOT)
+  const watcherSlot = slotFromEnv(env.PIXINSIGHT_CONNECTOR_SLOT);
   const pollIntervalMs = opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   const deadCheckIntervalMs = opts.deadCheckIntervalMs ?? DEFAULT_DEAD_CHECK_INTERVAL_MS;
   const pickupTimeoutMs = opts.pickupTimeoutMs ?? DEFAULT_PICKUP_TIMEOUT_MS;
@@ -550,6 +553,9 @@ export function createBridge(opts = {}) {
     // missing PIXINSIGHT_BIN): no watcher will ever beat, so the wait below stops at once.
     let spawnError = null;
     const tickets = []; // this call's tickets, removed on give-up when no watcher can take them
+    // With a slot, each launch is a `-x=N:` handoff, never an instance itself: one whose watcher never
+    // beat is waiting on (or showing an error for) an instance that is not there, and is ended on give-up.
+    const handoffs = [];
     const launch = (reason = null) => {
       assertLaunchable(watcherPath); // never hand PixInsight a path it would split or cut short
       launches++;
@@ -562,7 +568,8 @@ export function createBridge(opts = {}) {
       bfs.writeFileSync(ticket + '.tmp', JSON.stringify({ lingerMs, at: launchedAt, pid }));
       bfs.renameSync(ticket + '.tmp', ticket + '.json');
       tickets.push(ticket + '.json');
-      const child = spawnWatcher(piBin, ['-x=' + toPixPath(watcherPath)]);
+      const child = spawnWatcher(piBin, ['-x=' + (watcherSlot ? `${watcherSlot}:` : '') + toPixPath(watcherPath)]);
+      if (watcherSlot && child) handoffs.push(child);
       child?.on?.('error', (e) => {
         logFn(`  [bridge] watcher launch failed: ${spawnFailureMessage(piBin, e)}`);
         spawnError ??= e;
@@ -573,6 +580,16 @@ export function createBridge(opts = {}) {
       await awaitWatcherStart();
     } catch (e) {
       await dropTicketsOnGiveUp(tickets, spawnError);
+      for (const child of handoffs) {
+        if (child.exitCode == null && child.signalCode == null) {
+          try {
+            child.kill?.();
+            trace({ kind: 'event', event: 'handoff ended', pid: child.pid ?? null });
+          } catch {
+            // already gone
+          }
+        }
+      }
       throw e;
     }
 
