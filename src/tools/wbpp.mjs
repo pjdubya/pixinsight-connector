@@ -32,20 +32,24 @@ const FS_METRICS = ['FWHM', 'eccentricity', 'SNR', 'PSFSignalWeight', 'median', 
 const LIGHT = 4; // WBPP image type index for rejection_N / combination_N: 1 Bias, 2 Dark, 3 Flat, 4 Light
 const PARAM_NAME_RE = /^[A-Za-z][A-Za-z0-9_.]*$/;
 
-// output_dir: an absolute folder named WBPP whose parent (the target folder) exists, else a folder
+// output_dir: an absolute folder named WBPP whose parent (the target folder) exists, or a scope's folder in it
+// (<target>/WBPP/<scope>), else a folder
 // inside <workspace>/output or the state folder (resolveExportPath).
 export function resolveWbppOutputDir(outputDir, { workspaceOutputDir, stateDir }, { fs = nodeFs, platform = process.platform } = {}) {
   const p = platform === 'win32' ? path.win32 : path.posix;
   if (p.isAbsolute(outputDir)) {
     const target = p.resolve(outputDir);
-    if (p.basename(target).toUpperCase() === 'WBPP') {
-      const parent = p.dirname(target);
-      if (parent !== target && fs.existsSync(parent) && fs.statSync(parent).isDirectory()) return { path: target };
+    // <target>\WBPP, or one scope's folder in it, <target>\WBPP\<scope> (letters, digits, - and _)
+    const scoped = /^[A-Za-z0-9_-]+$/.test(p.basename(target)) && p.basename(p.dirname(target)).toUpperCase() === 'WBPP';
+    const wbpp = scoped ? p.dirname(target) : target;
+    if (p.basename(wbpp).toUpperCase() === 'WBPP') {
+      const parent = p.dirname(wbpp);
+      if (parent !== wbpp && fs.existsSync(parent) && fs.statSync(parent).isDirectory()) return { path: target };
       return { error: `output_dir: the target folder ${parent} of ${target} does not exist.` };
     }
   }
   const r = resolveExportPath(outputDir, { outputDir: workspaceOutputDir, stateDir }, platform);
-  return r.error ? { error: `${r.error.replace('file_path', 'output_dir')} A folder named WBPP in an existing target folder is also allowed.` } : r;
+  return r.error ? { error: `${r.error.replace('file_path', 'output_dir')} A folder named WBPP in an existing target folder, or <target>\\WBPP\\<scope>, is also allowed.` } : r;
 }
 
 // A WBPP -r value is split on commas by PixInsight, so no value may contain one.

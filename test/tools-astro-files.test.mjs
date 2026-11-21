@@ -464,6 +464,14 @@ test('run_wbpp writes into <target>/WBPP outside the workspace when the target f
   assert.match(notWbpp.text, /output_dir must be inside/);
   assert.equal(f.spawned.length, 1);
 
+  // one scope's folder in it, <target>/WBPP/<scope>; never deeper, nor a name with other signs
+  const scoped = await f.runWbpp.handler(f.api, { input_dirs: [f.input], output_dir: path.join(wbppDir, 'C8HD') });
+  assert.ok(!scoped.isError, scoped.text);
+  const deeper = await f.runWbpp.handler(f.api, { input_dirs: [f.input], output_dir: path.join(wbppDir, 'C8HD', 'x') });
+  assert.equal(deeper.isError, true);
+  const odd = await f.runWbpp.handler(f.api, { input_dirs: [f.input], output_dir: path.join(wbppDir, 'a b') });
+  assert.equal(odd.isError, true);
+
   const fakeFs = { existsSync: (x) => x === 'D:\\Pictures\\NINA\\M27', statSync: () => ({ isDirectory: () => true }) };
   const ctx = { workspaceOutputDir: 'D:\\WS\\output', stateDir: 'D:\\WS\\agentic' };
   assert.deepEqual(resolveWbppOutputDir('D:\\Pictures\\NINA\\M27\\wbpp', ctx, { fs: fakeFs, platform: 'win32' }), { path: 'D:\\Pictures\\NINA\\M27\\wbpp' });
